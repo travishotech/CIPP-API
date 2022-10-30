@@ -20,11 +20,12 @@ function Get-NormalizedError {
         'Response status code does not indicate success: 400 (Bad Request).' { 'Error 400 occured. There is an issue with the token configuration for this tenant. Please perform an access check' }
         '*Microsoft.Skype.Sync.Pstn.Tnm.Common.Http.HttpResponseException*' { 'Could not connect to Teams Admin center - Tenant might be missing a Teams license' }
         '*Provide valid credential.*' { 'Error 400: There is an issue with your Exchange Token configuration. Please perform an access check for this tenant' }
-        '*This indicate that a subscription within the tenant has lapsed*' { "There is no exchange subscription available, or it has lapsed. Check licensing information." }
-        '*User was not found.*' { "The relationship between this tenant and the partner has been dissolved from the tenant side." }
-        '*The user or administrator has not consented to use the application*' { "AADSTS65001: The user you have used for your Secure Application Model is a guest in this tenant, or your are using GDAP and have not added the user to the correct group. Please delete the guest user to gain access to this tenant" }
-        '*AADSTS50020*' { "AADSTS50020: The user you have used for your Secure Application Model is a guest in this tenant, or your are using GDAP and have not added the user to the correct group. Please delete the guest user to gain access to this tenant" }
-        '*invalid or malformed*' { "The request is malformed. You have entered incorrect tokens or have not performed a clear of the token cache after entering new tokens. Please see the troubleshooting documentation on how to execute a clear of the token cache." }
+        '*This indicate that a subscription within the tenant has lapsed*' { 'There is no exchange subscription available, or it has lapsed. Check licensing information.' }
+        '*User was not found.*' { 'The relationship between this tenant and the partner has been dissolved from the tenant side.' }
+        '*The user or administrator has not consented to use the application*' { 'AADSTS65001: The user you have used for your Secure Application Model is a guest in this tenant, or your are using GDAP and have not added the user to the correct group. Please delete the guest user to gain access to this tenant' }
+        '*AADSTS50020*' { 'AADSTS50020: The user you have used for your Secure Application Model is a guest in this tenant, or your are using GDAP and have not added the user to the correct group. Please delete the guest user to gain access to this tenant' }
+        '*invalid or malformed*' { 'The request is malformed. You have entered incorrect tokens or have not performed a clear of the token cache after entering new tokens. Please see the troubleshooting documentation on how to execute a clear of the token cache.' }
+        '*Windows Store repository apps feature is not supported for this tenant*' { 'This tenant does not have WinGet support available' }
         Default { $message }
         
     }
@@ -71,10 +72,12 @@ function Get-GraphToken($tenantid, $scope, $AsApp, $AppID, $refreshToken, $Retur
         $TenantsTable = Get-CippTable -tablename Tenants
         $Filter = "PartitionKey eq 'Tenants' and (defaultDomainName eq '{0}' or customerId eq '{0}')" -f $tenantid
         $Tenant = Get-AzDataTableRow @TenantsTable -Filter $Filter
-        if (!$Tenant) {
-            $Tenant = @{
+        if (!$Tenant.RowKey) {
+            $donotset = $true
+            $Tenant = [pscustomobject]@{
                 GraphErrorCount     = $null
                 LastGraphTokenError = $null
+                LastGraphError      = $null
                 PartitionKey        = 'TenantFailed'
                 RowKey              = 'Failed'
             }
@@ -88,7 +91,7 @@ function Get-GraphToken($tenantid, $scope, $AsApp, $AppID, $refreshToken, $Retur
         }
         $Tenant.GraphErrorCount++
 
-        Update-AzDataTableRow @TenantsTable -Entity $Tenant
+        if (!$donotset) { Update-AzDataTableRow @TenantsTable -Entity $Tenant }
         throw "$($Tenant.LastGraphError)"
     }
 }
@@ -126,6 +129,7 @@ function New-GraphGetRequest {
         $scope, 
         $AsApp, 
         $noPagination,
+        $NoAuthCheck,
         [switch]$ComplexFilter
     ) 
 
@@ -154,7 +158,7 @@ function New-GraphGetRequest {
             RowKey          = 'Failed'
         }
     }
-    if ((Get-AuthorisedRequest -Uri $uri -TenantID $tenantid)) {
+    if ((Get-AuthorisedRequest -Uri $uri -TenantID $tenantid) -or $NoAuthCheck) {
         $ReturnedData = do {
             try {
                 $Data = (Invoke-RestMethod -Uri $nextURL -Method GET -Headers $headers -ContentType 'application/json; charset=utf-8')
@@ -164,9 +168,11 @@ function New-GraphGetRequest {
             catch {
                 $Message = ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction SilentlyContinue).error.message
                 if ($Message -eq $null) { $Message = $($_.Exception.Message) }
-                $Tenant.LastGraphError = $Message
-                $Tenant.GraphErrorCount++
-                Update-AzDataTableRow @TenantsTable -Entity $Tenant
+                if ($Message -ne 'Request not applicable to target tenant.') {
+                    $Tenant.LastGraphError = $Message
+                    $Tenant.GraphErrorCount++
+                    Update-AzDataTableRow @TenantsTable -Entity $Tenant
+                }
                 throw $Message
             }
         } until ($null -eq $NextURL)
@@ -179,7 +185,7 @@ function New-GraphGetRequest {
     }
 }       
 
-function New-GraphPOSTRequest ($uri, $tenantid, $body, $type, $scope, $AsApp) {
+function New-GraphPOSTRequest ($uri, $tenantid, $body, $type, $scope, $AsApp, $NoAuthCheck) {
 
     $headers = Get-GraphToken -tenantid $tenantid -scope $scope -AsApp $asapp
     Write-Verbose "Using $($uri) as url"
@@ -187,7 +193,7 @@ function New-GraphPOSTRequest ($uri, $tenantid, $body, $type, $scope, $AsApp) {
         $type = 'POST'
     }
    
-    if ((Get-AuthorisedRequest -Uri $uri -TenantID $tenantid)) {
+    if ((Get-AuthorisedRequest -Uri $uri -TenantID $tenantid) -or $NoAuthCheck) {
         try {
             $ReturnedData = (Invoke-RestMethod -Uri $($uri) -Method $TYPE -Body $body -Headers $headers -ContentType 'application/json; charset=utf-8')
         }
@@ -419,28 +425,33 @@ function Get-Tenants {
 }
 
 function Remove-CIPPCache {
+    param (
+        $TenantsOnly
+    )
     # Remove all tenants except excluded
     $TenantsTable = Get-CippTable -tablename 'Tenants'
     $Filter = "PartitionKey eq 'Tenants' and Excluded eq false" 
     $ClearIncludedTenants = Get-AzDataTableRow @TenantsTable -Filter $Filter
     Remove-AzDataTableRow @TenantsTable -Entity $ClearIncludedTenants
+    if ($tenantsonly -eq 'false') {
+        Write-Host "Clearing all"
+        # Remove Domain Analyser cached results
+        $DomainsTable = Get-CippTable -tablename 'Domains'
+        $Filter = "PartitionKey eq 'TenantDomains'"
+        $ClearDomainAnalyserRows = Get-AzDataTableRow @DomainsTable -Filter $Filter | ForEach-Object {
+            $_.DomainAnalyser = ''
+            $_
+        }
+        Update-AzDataTableEntity @DomainsTable -Entity $ClearDomainAnalyserRows
+        #Clear BPA
+        $BPATable = Get-CippTable -tablename 'cachebpa'
+        $ClearBPARows = Get-AzDataTableRow @BPATable
+        Remove-AzDataTableEntity @BPATable -Entity $ClearBPARows
 
-    # Remove Domain Analyser cached results
-    $DomainsTable = Get-CippTable -tablename 'Domains'
-    $Filter = "PartitionKey eq 'TenantDomains'"
-    $ClearDomainAnalyserRows = Get-AzDataTableRow @DomainsTable -Filter $Filter | ForEach-Object {
-        $_.DomainAnalyser = ''
-        $_
+        $Script:SkipListCache = $Null
+        $Script:SkipListCacheEmpty = $Null
+        $Script:IncludedTenantsCache = $Null
     }
-    Update-AzDataTableEntity @DomainsTable -Entity $ClearDomainAnalyserRows
-    #Clear BPA
-    $BPATable = Get-CippTable -tablename 'cachebpa'
-    $ClearBPARows = Get-AzDataTableRow @BPATable
-    Remove-AzDataTableEntity @BPATable -Entity $ClearBPARows
-
-    $Script:SkipListCache = $Null
-    $Script:SkipListCacheEmpty = $Null
-    $Script:IncludedTenantsCache = $Null
 }
 
 function New-ExoRequest ($tenantid, $cmdlet, $cmdParams) {
